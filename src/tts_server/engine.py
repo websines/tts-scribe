@@ -91,11 +91,21 @@ class TTSEngine:
         from qwen_tts import Qwen3TTSModel
 
         torch.set_float32_matmul_precision("high")
+
+        # Use flash_attention_2 if available, fall back to sdpa (built into PyTorch)
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+            logger.info("Using flash_attention_2")
+        except ImportError:
+            attn_impl = "sdpa"
+            logger.info("flash-attn not installed, using PyTorch SDPA")
+
         return Qwen3TTSModel.from_pretrained(
             self.config.model_name,
             device_map=self.config.device,
             dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
         )
 
     def _enable_optimizations(self) -> None:
