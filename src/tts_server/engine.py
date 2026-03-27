@@ -119,13 +119,10 @@ class TTSEngine:
         )
 
     def _create_clone_prompt(self) -> Any:
-        ref_text = self.config.ref_text
-        if not ref_text:
-            logger.warning("TTS_REF_TEXT is empty — using x_vector_only_mode (lower quality)")
         return self.model.create_voice_clone_prompt(
             ref_audio=self.config.ref_audio_path,
-            ref_text=ref_text or "",
-            x_vector_only_mode=not bool(ref_text),
+            ref_text=self.config.ref_text or "",
+            x_vector_only_mode=True,
         )
 
     def _enable_optimizations(self) -> None:
