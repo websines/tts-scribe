@@ -15,8 +15,12 @@ class Settings(BaseSettings):
     )
 
     # Model
-    model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     device: str = "cuda:0"
+
+    # Voice clone reference (for Base model)
+    ref_audio_path: str = "audio.mp3"
+    ref_text: str = ""
 
     # Server
     host: str = "0.0.0.0"

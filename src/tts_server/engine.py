@@ -27,9 +27,7 @@ class InferenceMode(Enum):
 class InferenceJob:
     mode: InferenceMode
     params: dict[str, Any]
-    # For BATCH: caller awaits this future for the final (audio, sr) result
     future: asyncio.Future | None = None
-    # For STREAM: engine pushes chunks here; caller reads from it
     chunk_queue: asyncio.Queue | None = None
     created_at: float = field(default_factory=time.monotonic)
 
@@ -45,6 +43,8 @@ class TTSEngine:
         self._speakers: list[str] = []
         self._languages: list[str] = []
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._voice_clone_prompt: Any = None
+        self._is_base_model: bool = False
 
     # -- Lifecycle --
 
@@ -53,10 +53,22 @@ class TTSEngine:
         logger.info("Loading model %s on %s ...", self.config.model_name, self.config.device)
 
         self.model = await asyncio.to_thread(self._load_model)
+
+        # Detect model type
+        model_type = getattr(self.model, "tts_model_type", "")
+        self._is_base_model = "base" in str(model_type).lower() or "Base" in self.config.model_name
+        logger.info("Model type: %s (is_base=%s)", model_type, self._is_base_model)
+
         self._speakers = list(self.model.get_supported_speakers())
         self._languages = list(self.model.get_supported_languages())
         logger.info("Speakers: %s", self._speakers)
         logger.info("Languages: %s", self._languages)
+
+        # Pre-compute voice clone prompt for Base model
+        if self._is_base_model and self.config.ref_audio_path:
+            logger.info("Creating voice clone prompt from %s ...", self.config.ref_audio_path)
+            self._voice_clone_prompt = await asyncio.to_thread(self._create_clone_prompt)
+            logger.info("Voice clone prompt ready.")
 
         if self.config.enable_compile:
             logger.info("Enabling streaming optimizations (torch.compile) ...")
@@ -75,13 +87,11 @@ class TTSEngine:
         logger.info("Shutting down engine ...")
         self._running.clear()
         if self._worker_task:
-            # Push a sentinel so the worker wakes up and exits
             try:
                 self._queue.put_nowait(None)  # type: ignore[arg-type]
             except asyncio.QueueFull:
                 pass
             await self._worker_task
-        # Drain remaining jobs and cancel them
         while not self._queue.empty():
             job = self._queue.get_nowait()
             if job and job.future and not job.future.done():
@@ -93,7 +103,6 @@ class TTSEngine:
 
         torch.set_float32_matmul_precision("high")
 
-        # Use flash_attention_2 if available, fall back to sdpa (built into PyTorch)
         try:
             import flash_attn  # noqa: F401
             attn_impl = "flash_attention_2"
@@ -107,6 +116,16 @@ class TTSEngine:
             device_map=self.config.device,
             dtype=torch.bfloat16,
             attn_implementation=attn_impl,
+        )
+
+    def _create_clone_prompt(self) -> Any:
+        ref_text = self.config.ref_text
+        if not ref_text:
+            logger.warning("TTS_REF_TEXT is empty — using x_vector_only_mode (lower quality)")
+        return self.model.create_voice_clone_prompt(
+            ref_audio=self.config.ref_audio_path,
+            ref_text=ref_text or "",
+            x_vector_only_mode=not bool(ref_text),
         )
 
     def _enable_optimizations(self) -> None:
@@ -127,21 +146,40 @@ class TTSEngine:
             "Third warmup to stabilize performance.",
         ]
         for text in warmup_texts:
-            if hasattr(self.model, "stream_generate_pcm"):
-                for _chunk, _sr in self.model.stream_generate_pcm(
-                    text=text,
-                    language="English",
-                    speaker=self.config.default_voice,
-                    emit_every_frames=self.config.emit_every_frames,
-                    decode_window_frames=self.config.decode_window_frames,
-                ):
-                    pass
+            if self._is_base_model and self._voice_clone_prompt:
+                # Warmup with streaming voice clone
+                if hasattr(self.model, "stream_generate_voice_clone"):
+                    for _chunk, _sr in self.model.stream_generate_voice_clone(
+                        text=text,
+                        language="English",
+                        voice_clone_prompt=self._voice_clone_prompt,
+                        emit_every_frames=self.config.emit_every_frames,
+                        decode_window_frames=self.config.decode_window_frames,
+                    ):
+                        pass
+                else:
+                    self.model.generate_voice_clone(
+                        text=text,
+                        language="English",
+                        voice_clone_prompt=self._voice_clone_prompt,
+                    )
             else:
-                self.model.generate_custom_voice(
-                    text=text,
-                    language="English",
-                    speaker=self.config.default_voice,
-                )
+                # Warmup with custom voice
+                if hasattr(self.model, "stream_generate_pcm"):
+                    for _chunk, _sr in self.model.stream_generate_pcm(
+                        text=text,
+                        language="English",
+                        speaker=self.config.default_voice,
+                        emit_every_frames=self.config.emit_every_frames,
+                        decode_window_frames=self.config.decode_window_frames,
+                    ):
+                        pass
+                else:
+                    self.model.generate_custom_voice(
+                        text=text,
+                        language="English",
+                        speaker=self.config.default_voice,
+                    )
         logger.info("Warmup complete.")
 
     # -- Properties --
@@ -153,6 +191,10 @@ class TTSEngine:
     @property
     def languages(self) -> list[str]:
         return self._languages
+
+    @property
+    def is_base_model(self) -> bool:
+        return self._is_base_model
 
     @property
     def queue_depth(self) -> int:
@@ -169,7 +211,6 @@ class TTSEngine:
     # -- Public API --
 
     async def synthesize(self, params: dict[str, Any]) -> tuple[np.ndarray, int]:
-        """Submit a batch (non-streaming) job. Returns (audio_array, sample_rate)."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[tuple[np.ndarray, int]] = loop.create_future()
         job = InferenceJob(mode=InferenceMode.BATCH, params=params, future=future)
@@ -180,7 +221,6 @@ class TTSEngine:
         return await asyncio.wait_for(future, timeout=self.config.request_timeout)
 
     async def synthesize_stream(self, params: dict[str, Any]):
-        """Submit a streaming job. Yields (chunk_bytes, sample_rate) tuples."""
         chunk_queue: asyncio.Queue = asyncio.Queue()
         job = InferenceJob(mode=InferenceMode.STREAM, params=params, chunk_queue=chunk_queue)
         try:
@@ -228,13 +268,12 @@ class TTSEngine:
 
         logger.info("GPU worker stopped.")
 
+    # -- Batch inference --
+
     def _run_batch(self, job: InferenceJob) -> None:
         p = job.params
-        wavs, sr = self.model.generate_custom_voice(
-            text=p["text"],
-            language=p.get("language", self.config.default_language),
-            speaker=p.get("voice", self.config.default_voice),
-            instruct=p.get("instruct", ""),
+        language = p.get("language", self.config.default_language)
+        gen_kwargs = dict(
             do_sample=True,
             top_k=p.get("top_k", 50),
             top_p=p.get("top_p", 1.0),
@@ -242,51 +281,64 @@ class TTSEngine:
             repetition_penalty=p.get("repetition_penalty", 1.05),
             max_new_tokens=p.get("max_new_tokens", 2048),
         )
-        result = (wavs[0], sr)
-        self._loop.call_soon_threadsafe(job.future.set_result, result)
+
+        if self._is_base_model and self._voice_clone_prompt:
+            wavs, sr = self.model.generate_voice_clone(
+                text=p["text"],
+                language=language,
+                voice_clone_prompt=self._voice_clone_prompt,
+                **gen_kwargs,
+            )
+        else:
+            wavs, sr = self.model.generate_custom_voice(
+                text=p["text"],
+                language=language,
+                speaker=p.get("voice", self.config.default_voice),
+                instruct=p.get("instruct", ""),
+                **gen_kwargs,
+            )
+
+        self._loop.call_soon_threadsafe(job.future.set_result, (wavs[0], sr))
+
+    # -- Streaming inference --
 
     def _run_streaming(self, job: InferenceJob) -> None:
         p = job.params
-        voice = p.get("voice", self.config.default_voice)
         language = p.get("language", self.config.default_language)
-        instruct = p.get("instruct", "")
         text = p["text"]
 
-        # Try true token-level streaming first (works with Base model)
-        used_native_stream = False
-        model_type = getattr(self.model, "tts_model_type", None)
-
-        if model_type != "custom_voice" and hasattr(self.model, "stream_generate_voice_clone"):
-            gen_kwargs = dict(
+        # Base model: true token-level streaming via stream_generate_voice_clone
+        if self._is_base_model and self._voice_clone_prompt and hasattr(self.model, "stream_generate_voice_clone"):
+            for chunk, sr in self.model.stream_generate_voice_clone(
                 text=text,
                 language=language,
+                voice_clone_prompt=self._voice_clone_prompt,
                 emit_every_frames=self.config.emit_every_frames,
                 decode_window_frames=self.config.decode_window_frames,
-            )
-            try:
-                for chunk, sr in self.model.stream_generate_voice_clone(**gen_kwargs):
-                    self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, (chunk, sr))
-                used_native_stream = True
-            except (ValueError, AttributeError):
-                pass
+            ):
+                self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, (chunk, sr))
+            self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, _SENTINEL)
+            return
 
-        # Sentence-level streaming fallback (CustomVoice or if native fails)
-        if not used_native_stream:
-            sentences = _split_sentences(text)
-            for sentence in sentences:
-                wavs, sr = self.model.generate_custom_voice(
-                    text=sentence,
-                    language=language,
-                    speaker=voice,
-                    instruct=instruct,
-                    do_sample=True,
-                    top_k=p.get("top_k", 50),
-                    top_p=p.get("top_p", 1.0),
-                    temperature=p.get("temperature", 0.9),
-                    repetition_penalty=p.get("repetition_penalty", 1.05),
-                    max_new_tokens=p.get("max_new_tokens", 2048),
-                )
-                self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, (wavs[0], sr))
+        # CustomVoice fallback: sentence-level streaming
+        voice = p.get("voice", self.config.default_voice)
+        instruct = p.get("instruct", "")
+        sentences = _split_sentences(text)
+
+        for sentence in sentences:
+            wavs, sr = self.model.generate_custom_voice(
+                text=sentence,
+                language=language,
+                speaker=voice,
+                instruct=instruct,
+                do_sample=True,
+                top_k=p.get("top_k", 50),
+                top_p=p.get("top_p", 1.0),
+                temperature=p.get("temperature", 0.9),
+                repetition_penalty=p.get("repetition_penalty", 1.05),
+                max_new_tokens=p.get("max_new_tokens", 2048),
+            )
+            self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, (wavs[0], sr))
 
         self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, _SENTINEL)
 
@@ -295,20 +347,16 @@ _SENTENCE_RE = re.compile(r'(?<=[.!?;:。！？；：…])\s+|(?<=\.\.\.)\s+')
 
 
 def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences. Merges short fragments with the previous sentence."""
     parts = _SENTENCE_RE.split(text.strip())
     if not parts:
         return [text.strip()]
-
     sentences: list[str] = []
     for part in parts:
         part = part.strip()
         if not part:
             continue
-        # Merge short fragments (< 15 chars) with previous
         if sentences and len(part) < 15:
             sentences[-1] = sentences[-1] + " " + part
         else:
             sentences.append(part)
-
     return sentences if sentences else [text.strip()]
