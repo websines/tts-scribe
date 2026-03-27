@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -249,36 +250,65 @@ class TTSEngine:
         voice = p.get("voice", self.config.default_voice)
         language = p.get("language", self.config.default_language)
         instruct = p.get("instruct", "")
+        text = p["text"]
 
-        gen_kwargs = dict(
-            text=p["text"],
-            language=language,
-            emit_every_frames=self.config.emit_every_frames,
-            decode_window_frames=self.config.decode_window_frames,
-        )
+        # Try true token-level streaming first (works with Base model)
+        used_native_stream = False
+        model_type = getattr(self.model, "tts_model_type", None)
 
-        # Use stream_generate_pcm for custom voice if available
-        if hasattr(self.model, "stream_generate_pcm"):
-            gen_kwargs["speaker"] = voice
-            if instruct:
-                gen_kwargs["instruct"] = instruct
-            stream = self.model.stream_generate_pcm(**gen_kwargs)
-        elif hasattr(self.model, "stream_generate_voice_clone"):
-            # Fallback to voice clone streaming (requires prompt)
-            stream = self.model.stream_generate_voice_clone(**gen_kwargs)
-        else:
-            # No streaming support — fall back to batch and send as single chunk
-            wavs, sr = self.model.generate_custom_voice(
-                text=p["text"],
+        if model_type != "custom_voice" and hasattr(self.model, "stream_generate_voice_clone"):
+            gen_kwargs = dict(
+                text=text,
                 language=language,
-                speaker=voice,
-                instruct=instruct,
+                emit_every_frames=self.config.emit_every_frames,
+                decode_window_frames=self.config.decode_window_frames,
             )
-            self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, (wavs[0], sr))
-            self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, _SENTINEL)
-            return
+            try:
+                for chunk, sr in self.model.stream_generate_voice_clone(**gen_kwargs):
+                    self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, (chunk, sr))
+                used_native_stream = True
+            except (ValueError, AttributeError):
+                pass
 
-        for chunk, sr in stream:
-            self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, (chunk, sr))
+        # Sentence-level streaming fallback (CustomVoice or if native fails)
+        if not used_native_stream:
+            sentences = _split_sentences(text)
+            for sentence in sentences:
+                wavs, sr = self.model.generate_custom_voice(
+                    text=sentence,
+                    language=language,
+                    speaker=voice,
+                    instruct=instruct,
+                    do_sample=True,
+                    top_k=p.get("top_k", 50),
+                    top_p=p.get("top_p", 1.0),
+                    temperature=p.get("temperature", 0.9),
+                    repetition_penalty=p.get("repetition_penalty", 1.05),
+                    max_new_tokens=p.get("max_new_tokens", 2048),
+                )
+                self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, (wavs[0], sr))
 
         self._loop.call_soon_threadsafe(job.chunk_queue.put_nowait, _SENTINEL)
+
+
+_SENTENCE_RE = re.compile(r'(?<=[.!?;:。！？；：…])\s+|(?<=\.\.\.)\s+')
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences. Merges short fragments with the previous sentence."""
+    parts = _SENTENCE_RE.split(text.strip())
+    if not parts:
+        return [text.strip()]
+
+    sentences: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Merge short fragments (< 15 chars) with previous
+        if sentences and len(part) < 15:
+            sentences[-1] = sentences[-1] + " " + part
+        else:
+            sentences.append(part)
+
+    return sentences if sentences else [text.strip()]
