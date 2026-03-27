@@ -134,6 +134,9 @@ class TTSEngine:
             use_compile=True,
             use_cuda_graphs=False,
             compile_mode="reduce-overhead",
+            use_fast_codebook=True,
+            compile_codebook_predictor=True,
+            compile_talker=True,
         )
 
     def _warmup(self) -> None:
