@@ -1,0 +1,42 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+.env
+.venv/
+venv/
+.python-version
+
+*.wav
+*.mp3
+*.pcm
+
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+*.log
+
+# uv
+uv.lock
+
+# Model cache
+*.bin
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Research notes
+RESEARCH.md
+
+.claude/
